@@ -1,241 +1,217 @@
-// executor.cpp — roblox luau executor DLL
-// build: g++ -O2 -shared -static-libgcc -static-libstdc++ -o executor.dll executor.cpp -lkernel32 -luser32
+// injector.cpp — launches/attaches to RobloxPlayerBeta.exe and injects a DLL
+// build: g++ -O2 -static -o injector.exe injector.cpp -lkernel32 -luser32
+// usage: injector.exe path\to\executor.dll
 
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <string>
-#include <vector>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <iostream>
-#include <thread>
-#include <atomic>
-
-// ---- luau typedefs ----
-using lua_State      = void;
-using lua_CFunction  = int(*)(lua_State*);
-
-// luau function signatures
-using luau_load_t     = int(*)(lua_State*, const char*, const char*, size_t, int);
-using lua_pcall_t     = int(*)(lua_State*, int, int, int);
-using luaL_newstate_t = lua_State*(*)();
-using lua_close_t     = void(*)(lua_State*);
-using lua_pushcclosure_t = void(*)(lua_State*, lua_CFunction, int);
-using lua_setglobal_t = void(*)(lua_State*, const char*);
-using lua_getglobal_t = void(*)(lua_State*, const char*);
-
-// globals
-static lua_State*          g_L        = nullptr;
-static luau_load_t         luau_load  = nullptr;
-static lua_pcall_t         lua_pcall  = nullptr;
-static lua_getglobal_t     lua_getglobal = nullptr;
-static lua_setglobal_t     lua_setglobal = nullptr;
-static lua_pushcclosure_t  lua_pushcclosure = nullptr;
-
-static std::atomic<bool>   g_running{true};
-static HANDLE              g_console = nullptr;
 
 // ----------------------------------------------------------------
-// pattern scanning helpers
+// find process id by exe name (case-insensitive)
 // ----------------------------------------------------------------
-static uintptr_t scan_pattern(uintptr_t base, size_t size,
-                              const char* pattern, const char* mask) {
-    size_t plen = strlen(mask);
-    for (size_t i = 0; i + plen <= size; ++i) {
-        bool hit = true;
-        for (size_t j = 0; j < plen; ++j) {
-            if (mask[j] == 'x' && *(uint8_t*)(base + i + j) != (uint8_t)pattern[j]) {
-                hit = false;
+static DWORD find_pid(const wchar_t* name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, name) == 0) {
+                pid = pe.th32ProcessID;
                 break;
             }
-        }
-        if (hit) return base + i;
+        } while (Process32NextW(snap, &pe));
     }
-    return 0;
-}
-
-static size_t module_size(HMODULE mod) {
-    auto dos = (IMAGE_DOS_HEADER*)mod;
-    auto nt  = (IMAGE_NT_HEADERS*)((uintptr_t)mod + dos->e_lfanew);
-    return nt->OptionalHeader.SizeOfImage;
+    CloseHandle(snap);
+    return pid;
 }
 
 // ----------------------------------------------------------------
-// resolve Luau functions by pattern scanning RobloxPlayerBeta.exe
+// enable SeDebugPrivilege — needed to open roblox with full access
 // ----------------------------------------------------------------
-bool resolve_luau() {
-    HMODULE base = GetModuleHandleW(nullptr);
-    if (!base) return false;
+static bool enable_debug_priv() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
 
-    uintptr_t start = (uintptr_t)base;
-    size_t    sz    = module_size(base);
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-    uintptr_t luau_load_addr = scan_pattern(
-        start, sz,
-        "\x48\x89\x5C\x24\x00\x48\x89\x6C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x60",
-        "xxxx?xxxx?xxxx?xxxxx");
+    BOOL ok = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    CloseHandle(tok);
+    return ok && GetLastError() == ERROR_SUCCESS;
+}
 
-    uintptr_t pcall_addr = scan_pattern(
-        start, sz,
-        "\x48\x83\xEC\x28\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x74",
-        "xxxxxxxx????xxxx");
-
-    uintptr_t setglobal_addr = scan_pattern(
-        start, sz,
-        "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x20\x48\x8B\xD9\x48\x8B\xF9",
-        "xxxx?xxxxxxxxx");
-
-    uintptr_t getglobal_addr = scan_pattern(
-        start, sz,
-        "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x20\x48\x8B\xD9\xE8",
-        "xxxx?xxxxxxxx");
-
-    uintptr_t pushcclosure_addr = scan_pattern(
-        start, sz,
-        "\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x20",
-        "xxxx?xxxx?xxxx");
-
-    if (!luau_load_addr || !pcall_addr || !setglobal_addr
-        || !getglobal_addr || !pushcclosure_addr) {
+// ----------------------------------------------------------------
+// inject DLL into pid via CreateRemoteThread + LoadLibraryW
+// ----------------------------------------------------------------
+static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
+    // 1. open process
+    HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!proc) {
+        printf("[!] OpenProcess failed (err=%lu) — run as admin\n", GetLastError());
         return false;
     }
 
-    luau_load        = (luau_load_t)luau_load_addr;
-    lua_pcall        = (lua_pcall_t)pcall_addr;
-    lua_setglobal    = (lua_setglobal_t)setglobal_addr;
-    lua_getglobal    = (lua_getglobal_t)getglobal_addr;
-    lua_pushcclosure = (lua_pushcclosure_t)pushcclosure_addr;
+    // 2. allocate space for the dll path in the remote process
+    SIZE_T path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
+    LPVOID remote_mem = VirtualAllocEx(proc, nullptr, path_bytes,
+                                       MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_READWRITE);
+    if (!remote_mem) {
+        printf("[!] VirtualAllocEx failed (err=%lu)\n", GetLastError());
+        CloseHandle(proc);
+        return false;
+    }
 
+    // 3. write the dll path into the remote memory
+    if (!WriteProcessMemory(proc, remote_mem, dll_path.c_str(),
+                            path_bytes, nullptr)) {
+        printf("[!] WriteProcessMemory failed (err=%lu)\n", GetLastError());
+        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
+
+    // 4. resolve LoadLibraryW (same address in every process on windows)
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) {
+        printf("[!] GetModuleHandleW(kernel32) failed\n");
+        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
+    FARPROC load_lib = GetProcAddress(k32, "LoadLibraryW");
+    if (!load_lib) {
+        printf("[!] GetProcAddress(LoadLibraryW) failed\n");
+        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
+
+    // 5. spawn a thread in the target process that calls LoadLibraryW(path)
+    HANDLE thread = CreateRemoteThread(proc, nullptr, 0,
+                                       (LPTHREAD_START_ROUTINE)load_lib,
+                                       remote_mem, 0, nullptr);
+    if (!thread) {
+        printf("[!] CreateRemoteThread failed (err=%lu)\n", GetLastError());
+        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
+
+    // 6. wait for LoadLibraryW to return
+    DWORD wait = WaitForSingleObject(thread, 15000);
+    if (wait == WAIT_TIMEOUT) {
+        printf("[!] injection thread timed out\n");
+        CloseHandle(thread);
+        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
+
+    // 7. check the thread's return value — LoadLibraryW returns the module
+    //    handle of the loaded DLL, or 0 on failure
+    DWORD module_handle = 0;
+    GetExitCodeThread(thread, &module_handle);
+
+    CloseHandle(thread);
+    VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+    CloseHandle(proc);
+
+    if (module_handle == 0) {
+        printf("[!] LoadLibraryW returned NULL inside roblox\n");
+        printf("    the dll was rejected — wrong architecture, missing deps,\n");
+        printf("    or byfron blocked the load\n");
+        return false;
+    }
+
+    printf("[+] module handle in target: 0x%08lX\n", module_handle);
     return true;
 }
 
 // ----------------------------------------------------------------
-// state retrieval — detour on lua_getglobal to capture L
+// main
 // ----------------------------------------------------------------
-struct Hook {
-    void* target = nullptr;
-    void* original = nullptr;
-    uint8_t saved[16]{};
-    void* stub = nullptr;
-};
+int main(int argc, char** argv) {
+    printf("=== dll injector ===\n");
 
-static Hook g_getglobal_hook;
-
-static void capture_state_hook(void* L, const char* name) {
-    if (!g_L) g_L = (lua_State*)L;
-    using fn_t = void(*)(void*, const char*);
-    ((fn_t)g_getglobal_hook.original)(L, name);
-}
-
-bool install_state_hook() {
-    if (!lua_getglobal) return false;
-
-    void* target = (void*)lua_getglobal;
-
-    uint8_t patch[12] = { 0x48, 0xB8 };
-    uint64_t dest = (uint64_t)&capture_state_hook;
-    memcpy(patch + 2, &dest, 8);
-    patch[10] = 0xFF;
-    patch[11] = 0xE0;
-
-    DWORD old;
-    VirtualProtect(target, 12, PAGE_EXECUTE_READWRITE, &old);
-    memcpy(g_getglobal_hook.saved, target, 12);
-    memcpy(target, patch, 12);
-    VirtualProtect(target, 12, old, &old);
-
-    g_getglobal_hook.target = target;
-    g_getglobal_hook.original = target;
-
-    return true;
-}
-
-// ----------------------------------------------------------------
-// execute a lua string against the captured state
-// ----------------------------------------------------------------
-bool execute_script(const std::string& src) {
-    if (!g_L) return false;
-    if (!luau_load || !lua_pcall) return false;
-
-    const char* chunkname = "@executor";
-
-    int load_res = luau_load(g_L, chunkname, src.data(), src.size(), 0);
-    if (load_res != 0) {
-        return false;
+    if (argc < 2) {
+        printf("usage: %s <path-to-dll>\n", argv[0]);
+        return 1;
     }
 
-    int pcall_res = lua_pcall(g_L, 0, 0, 0);
-    return pcall_res == 0;
-}
-
-// ----------------------------------------------------------------
-// console + input loop
-// ----------------------------------------------------------------
-void console_thread() {
-    AllocConsole();
-
-    freopen("CONOUT$", "w", stdout);
-    freopen("CONOUT$", "w", stderr);
-    freopen("CONIN$",  "r", stdin);
-
-    SetConsoleTitleW(L"executor");
-
-    printf("executor attached\n");
-    printf("waiting for luau state...\n");
-
-    for (int i = 0; i < 300 && !g_L; ++i) {
-        Sleep(100);
+    // convert to absolute path so it survives the remote call
+    char full[MAX_PATH] = {0};
+    if (!GetFullPathNameA(argv[1], MAX_PATH, full, nullptr)) {
+        printf("[!] could not resolve path: %s\n", argv[1]);
+        return 1;
     }
 
-    if (!g_L) {
-        printf("[!] failed to capture lua_State\n");
-        printf("    patterns may be outdated for this roblox version\n");
-        return;
+    // check the dll exists
+    DWORD attrs = GetFileAttributesA(full);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        printf("[!] file not found: %s\n", full);
+        return 1;
     }
 
-    printf("[+] lua_State captured: %p\n", g_L);
-    printf("type lua and hit enter. 'exit' to unload.\n\n");
+    // convert to wide string
+    wchar_t wide[MAX_PATH] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, full, -1, wide, MAX_PATH);
+    std::wstring dll_path(wide);
 
-    std::string line;
-    while (g_running) {
-        printf("> ");
-        std::getline(std::cin, line);
-        if (line == "exit" || line == "quit") break;
-        if (line.empty()) continue;
+    printf("[*] dll: %ls\n", dll_path.c_str());
 
-        if (execute_script(line)) {
-            printf("[ok]\n");
-        } else {
-            printf("[error] script failed\n");
+    // get debug privileges
+    if (!enable_debug_priv()) {
+        printf("[!] could not enable SeDebugPrivilege — run as admin\n");
+        return 1;
+    }
+
+    // wait for roblox
+    printf("[*] waiting for RobloxPlayerBeta.exe...\n");
+    DWORD pid = 0;
+    int waited = 0;
+    while (!pid && waited < 60000) {
+        pid = find_pid(L"RobloxPlayerBeta.exe");
+        if (!pid) {
+            Sleep(500);
+            waited += 500;
         }
     }
 
-    g_running = false;
-}
-
-// ----------------------------------------------------------------
-// DLL entry
-// ----------------------------------------------------------------
-BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(mod);
-        CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)[](LPVOID) -> DWORD {
-            Sleep(3000);
-
-            if (!resolve_luau()) {
-                AllocConsole();
-                freopen("CONOUT$", "w", stdout);
-                printf("[!] failed to resolve luau functions.\n");
-                printf("    update the patterns in resolve_luau().\n");
-                return 0;
-            }
-
-            install_state_hook();
-            console_thread();
-            return 0;
-        }, nullptr, 0, nullptr);
+    if (!pid) {
+        printf("[!] roblox not running after 60s — launch the game first\n");
+        return 1;
     }
-    return TRUE;
+
+    printf("[+] roblox found (pid %lu)\n", pid);
+
+    // give roblox a couple seconds to finish loading before injecting
+    printf("[*] waiting 3s for the client to settle...\n");
+    Sleep(3000);
+
+    // inject
+    printf("[*] injecting...\n");
+    if (inject_dll(pid, dll_path)) {
+        printf("[+] done. check for a console window from the dll.\n");
+        printf("    press enter to close this window.\n");
+        getchar();
+        return 0;
+    }
+
+    printf("[!] injection failed.\n");
+    printf("    press enter to close.\n");
+    getchar();
+    return 1;
 }
