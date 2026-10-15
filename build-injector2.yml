@@ -3,7 +3,7 @@ name: build-injector2
 on:
   push:
     paths:
-      - 'injector.cpp'
+      - 'injector2.cpp'
   workflow_dispatch:
 
 jobs:
@@ -15,10 +15,10 @@ jobs:
       - name: compile
         shell: cmd
         run: |
-          g++ -O2 -static -o injector.exe injector.cpp -lkernel32 -luser32
+          g++ -O2 -static -o injector2.exe injector2.cpp -lkernel32 -luser32
 
       - name: upload exe
         uses: actions/upload-artifact@v4
         with:
-          name: injector
-          path: injector.exe
+          name: injector2
+          path: injector2.exe
