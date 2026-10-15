@@ -3,7 +3,7 @@ name: build-cpp
 on:
   push:
     paths:
-      - 'main.cpp'
+      - '.github/workflows/main.cpp'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
       - name: compile
         shell: cmd
         run: |
-          g++ -O2 -static -o program.exe main.cpp
+          g++ -O2 -static -o program.exe .github/workflows/main.cpp
 
       - name: upload exe
         uses: actions/upload-artifact@v4
