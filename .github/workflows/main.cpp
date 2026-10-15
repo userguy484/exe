@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 
 // ----------------------------------------------------------------
 // find process id by exe name (case-insensitive)
@@ -44,7 +45,7 @@ static bool enable_debug_priv() {
 
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
-    LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+    LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &tp.Privileges[0].Luid);
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
     BOOL ok = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
@@ -56,14 +57,12 @@ static bool enable_debug_priv() {
 // inject DLL into pid via CreateRemoteThread + LoadLibraryW
 // ----------------------------------------------------------------
 static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
-    // 1. open process
     HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!proc) {
         printf("[!] OpenProcess failed (err=%lu) — run as admin\n", GetLastError());
         return false;
     }
 
-    // 2. allocate space for the dll path in the remote process
     SIZE_T path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
     LPVOID remote_mem = VirtualAllocEx(proc, nullptr, path_bytes,
                                        MEM_COMMIT | MEM_RESERVE,
@@ -74,7 +73,6 @@ static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
-    // 3. write the dll path into the remote memory
     if (!WriteProcessMemory(proc, remote_mem, dll_path.c_str(),
                             path_bytes, nullptr)) {
         printf("[!] WriteProcessMemory failed (err=%lu)\n", GetLastError());
@@ -83,7 +81,6 @@ static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
-    // 4. resolve LoadLibraryW (same address in every process on windows)
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32) {
         printf("[!] GetModuleHandleW(kernel32) failed\n");
@@ -99,7 +96,6 @@ static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
-    // 5. spawn a thread in the target process that calls LoadLibraryW(path)
     HANDLE thread = CreateRemoteThread(proc, nullptr, 0,
                                        (LPTHREAD_START_ROUTINE)load_lib,
                                        remote_mem, 0, nullptr);
@@ -110,7 +106,6 @@ static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
-    // 6. wait for LoadLibraryW to return
     DWORD wait = WaitForSingleObject(thread, 15000);
     if (wait == WAIT_TIMEOUT) {
         printf("[!] injection thread timed out\n");
@@ -120,8 +115,6 @@ static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
-    // 7. check the thread's return value — LoadLibraryW returns the module
-    //    handle of the loaded DLL, or 0 on failure
     DWORD module_handle = 0;
     GetExitCodeThread(thread, &module_handle);
 
@@ -148,37 +141,37 @@ int main(int argc, char** argv) {
 
     if (argc < 2) {
         printf("usage: %s <path-to-dll>\n", argv[0]);
+        printf("press enter to exit.\n");
+        std::cin.get();
         return 1;
     }
 
-    // convert to absolute path so it survives the remote call
     char full[MAX_PATH] = {0};
     if (!GetFullPathNameA(argv[1], MAX_PATH, full, nullptr)) {
         printf("[!] could not resolve path: %s\n", argv[1]);
+        std::cin.get();
         return 1;
     }
 
-    // check the dll exists
     DWORD attrs = GetFileAttributesA(full);
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         printf("[!] file not found: %s\n", full);
+        std::cin.get();
         return 1;
     }
 
-    // convert to wide string
     wchar_t wide[MAX_PATH] = {0};
     MultiByteToWideChar(CP_UTF8, 0, full, -1, wide, MAX_PATH);
     std::wstring dll_path(wide);
 
     printf("[*] dll: %ls\n", dll_path.c_str());
 
-    // get debug privileges
     if (!enable_debug_priv()) {
         printf("[!] could not enable SeDebugPrivilege — run as admin\n");
+        std::cin.get();
         return 1;
     }
 
-    // wait for roblox
     printf("[*] waiting for RobloxPlayerBeta.exe...\n");
     DWORD pid = 0;
     int waited = 0;
@@ -192,26 +185,22 @@ int main(int argc, char** argv) {
 
     if (!pid) {
         printf("[!] roblox not running after 60s — launch the game first\n");
+        std::cin.get();
         return 1;
     }
 
     printf("[+] roblox found (pid %lu)\n", pid);
-
-    // give roblox a couple seconds to finish loading before injecting
     printf("[*] waiting 3s for the client to settle...\n");
     Sleep(3000);
 
-    // inject
     printf("[*] injecting...\n");
     if (inject_dll(pid, dll_path)) {
         printf("[+] done. check for a console window from the dll.\n");
-        printf("    press enter to close this window.\n");
-        getchar();
-        return 0;
+    } else {
+        printf("[!] injection failed.\n");
     }
 
-    printf("[!] injection failed.\n");
-    printf("    press enter to close.\n");
-    getchar();
-    return 1;
+    printf("press enter to close.\n");
+    std::cin.get();
+    return 0;
 }
