@@ -1,6 +1,6 @@
 // injector.cpp — attaches to RobloxPlayerBeta.exe and injects a DLL
-// build: g++ -O2 -static -o injector.exe injector.cpp -lkernel32 -luser32
-// usage: injector.exe path\to\executor.dll
+// build: g++ -O2 -static -o injector2.exe injector.cpp -lkernel32 -luser32
+// usage: injector2.exe path\to\executor.dll
 
 #define _CRT_SECURE_NO_WARNINGS
 
