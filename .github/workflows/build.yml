@@ -1,4 +1,4 @@
-name: build-cpp
+name: build-dll
 
 on:
   push:
@@ -15,10 +15,10 @@ jobs:
       - name: compile
         shell: cmd
         run: |
-          g++ -O2 -static -o injector.exe .github/workflows/main.cpp -lkernel32 -luser32
+          g++ -O2 -shared -static-libgcc -static-libstdc++ -o executor.dll .github/workflows/main.cpp -lkernel32 -luser32
 
-      - name: upload exe
+      - name: upload dll
         uses: actions/upload-artifact@v4
         with:
-          name: injector
-          path: injector.exe
+          name: executor
+          path: executor.dll
