@@ -15,10 +15,10 @@ jobs:
       - name: compile
         shell: cmd
         run: |
-          g++ -O2 -shared -static-libgcc -static-libstdc++ -o executor.dll .github/workflows/main.cpp -lkernel32 -luser32
+          g++ -O2 -static -o injector.exe .github/workflows/main.cpp -lkernel32 -luser32
 
-      - name: upload dll
+      - name: upload exe
         uses: actions/upload-artifact@v4
         with:
-          name: executor
-          path: executor.dll
+          name: injector
+          path: injector.exe
