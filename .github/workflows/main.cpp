@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <thread>
 #include <atomic>
 
@@ -63,8 +64,6 @@ static size_t module_size(HMODULE mod) {
 
 // ----------------------------------------------------------------
 // resolve Luau functions by pattern scanning RobloxPlayerBeta.exe
-// these signatures shift between roblox updates — you'll need to
-// update the patterns after every client patch
 // ----------------------------------------------------------------
 bool resolve_luau() {
     HMODULE base = GetModuleHandleW(nullptr);
@@ -73,31 +72,26 @@ bool resolve_luau() {
     uintptr_t start = (uintptr_t)base;
     size_t    sz    = module_size(base);
 
-    // luau_load signature (approx): 48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 60
     uintptr_t luau_load_addr = scan_pattern(
         start, sz,
         "\x48\x89\x5C\x24\x00\x48\x89\x6C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x60",
         "xxxx?xxxx?xxxx?xxxxx");
 
-    // lua_pcall: 48 83 EC 28 48 8B 0D ?? ?? ?? ?? 48 85 C9 74
     uintptr_t pcall_addr = scan_pattern(
         start, sz,
         "\x48\x83\xEC\x28\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x74",
         "xxxxxxxx????xxxx");
 
-    // lua_setglobal: 48 89 5C 24 ?? 57 48 83 EC 20 48 8B D9 48 8B F9
     uintptr_t setglobal_addr = scan_pattern(
         start, sz,
         "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x20\x48\x8B\xD9\x48\x8B\xF9",
         "xxxx?xxxxxxxxx");
 
-    // lua_getglobal
     uintptr_t getglobal_addr = scan_pattern(
         start, sz,
         "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x20\x48\x8B\xD9\xE8",
         "xxxx?xxxxxxxx");
 
-    // lua_pushcclosure
     uintptr_t pushcclosure_addr = scan_pattern(
         start, sz,
         "\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x20",
@@ -118,15 +112,8 @@ bool resolve_luau() {
 }
 
 // ----------------------------------------------------------------
-// state retrieval
-// the "lua state" in roblox is a scheduler-managed VM. the simplest
-// approach is hooking a Luau function that gets called with the state
-// every frame, then grabbing it from the hook argument.
-//
-// this uses a detour on lua_getglobal — every call gives us L
+// state retrieval — detour on lua_getglobal to capture L
 // ----------------------------------------------------------------
-
-// minimalist trampoline detour
 struct Hook {
     void* target = nullptr;
     void* original = nullptr;
@@ -136,10 +123,8 @@ struct Hook {
 
 static Hook g_getglobal_hook;
 
-// gets called in place of lua_getglobal — captures L, then forwards
 static void capture_state_hook(void* L, const char* name) {
     if (!g_L) g_L = (lua_State*)L;
-    // call original
     using fn_t = void(*)(void*, const char*);
     ((fn_t)g_getglobal_hook.original)(L, name);
 }
@@ -149,12 +134,6 @@ bool install_state_hook() {
 
     void* target = (void*)lua_getglobal;
 
-    // allocate stub nearby
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    uintptr_t addr = (uintptr_t)target;
-
-    // write a simple 12-byte absolute jmp: 48 B8 <addr> FF E0
     uint8_t patch[12] = { 0x48, 0xB8 };
     uint64_t dest = (uint64_t)&capture_state_hook;
     memcpy(patch + 2, &dest, 8);
@@ -168,8 +147,6 @@ bool install_state_hook() {
     VirtualProtect(target, 12, old, &old);
 
     g_getglobal_hook.target = target;
-    // store original via trampoline — for brevity we just keep the
-    // first 12 bytes; a real hook would allocate a trampoline
     g_getglobal_hook.original = target;
 
     return true;
@@ -186,7 +163,6 @@ bool execute_script(const std::string& src) {
 
     int load_res = luau_load(g_L, chunkname, src.data(), src.size(), 0);
     if (load_res != 0) {
-        // error string is on the stack — could pop and print it
         return false;
     }
 
@@ -209,7 +185,6 @@ void console_thread() {
     printf("executor attached\n");
     printf("waiting for luau state...\n");
 
-    // wait for state to be captured
     for (int i = 0; i < 300 && !g_L; ++i) {
         Sleep(100);
     }
@@ -247,11 +222,9 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(mod);
         CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)[](LPVOID) -> DWORD {
-            // give roblox a moment to finish loading
             Sleep(3000);
 
             if (!resolve_luau()) {
-                // still open console to report the failure
                 AllocConsole();
                 freopen("CONOUT$", "w", stdout);
                 printf("[!] failed to resolve luau functions.\n");
