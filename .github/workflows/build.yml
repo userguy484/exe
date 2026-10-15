@@ -15,10 +15,10 @@ jobs:
       - name: compile
         shell: cmd
         run: |
-          g++ -O2 -static -o program.exe .github/workflows/main.cpp
+          g++ -O2 -shared -static-libgcc -static-libstdc++ -o executor.dll .github/workflows/main.cpp -lkernel32 -luser32
 
-      - name: upload exe
+      - name: upload dll
         uses: actions/upload-artifact@v4
         with:
-          name: program
-          path: program.exe
+          name: executor
+          path: executor.dll
