@@ -1,206 +1,105 @@
-// injector.cpp — attaches to RobloxPlayerBeta.exe and injects a DLL
-// build: g++ -O2 -static -o injector2.exe injector.cpp -lkernel32 -luser32
-// usage: injector2.exe path\to\executor.dll
-
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <windows.h>
-#include <tlhelp32.h>
-#include <string>
-#include <cstdio>
-#include <cstring>
 #include <iostream>
+#include <string>
+#include <vector>
 
-// ----------------------------------------------------------------
-// find process id by exe name (case-insensitive)
-// ----------------------------------------------------------------
-static DWORD find_pid(const wchar_t* name) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+extern "C" {
+    #include "lua.h"
+    #include "lualib.h"
+    #include "lauxlib.h"
+}
 
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    DWORD pid = 0;
+// Define a custom function to expose to Lua (e.g., print or game:HttpGet)
+static int custom_httpget(lua_State* L) {
+    const char* url = luaL_checkstring(L, 1);
+    std::string response = "Downloaded data from: " + std::string(url); // Replace with actual WinHTTP code
+    
+    lua_pushstring(L, response.c_str());
+    return 1; // Number of return values
+}
 
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, name) == 0) {
-                pid = pe.th32ProcessID;
-                break;
+// Define a custom function to expose the game global
+static int get_game(lua_State* L) {
+    // In a real executor, this would return the actual Roblox DataModel userdata
+    lua_newtable(L); // Fake game table for demonstration
+    lua_pushstring(L, "Fake Roblox Game Instance");
+    lua_setfield(L, -2, "Name");
+    return 1;
+}
+
+// Registry to inject functions into the Lua environment
+void RegisterAPI(lua_State* L) {
+    // Register a global function: HttpGet("url")
+    lua_pushcfunction(L, custom_httpget, "HttpGet");
+    lua_setglobal(L, "HttpGet");
+
+    // Register a global property: game
+    lua_pushcfunction(L, get_game, "game");
+    lua_setglobal(L, "game");
+}
+
+// The main execution function
+void ExecuteScript(lua_State* L, const std::string& script) {
+    // 1. Load the script into the VM
+    int status = luaL_loadbuffer(L, script.c_str(), script.length(), "ExecutorScript");
+    if (status != LUA_OK) {
+        std::cout << "[Lua Load Error] " << lua_tostring(L, -1) << std::endl;
+        lua_pop(L, 1);
+        return;
+    }
+
+    // 2. Register the custom API functions before running
+    RegisterAPI(L);
+
+    // 3. Execute the script via pcall (protected call)
+    status = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (status != LUA_OK) {
+        std::cout << "[Lua Runtime Error] " << lua_tostring(L, -1) << std::endl;
+        lua_pop(L, 1);
+    }
+}
+
+// Console allocation for debugging
+void SetupConsole() {
+    AllocConsole();
+    FILE* f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONIN$", "r", stdin);
+}
+
+// DLL Entry Point
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hModule);
+        
+        // Run the executor in a separate thread so we don't block Roblox
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            SetupConsole();
+            std::cout << "[+] Wesoda Internal Executor Initialized.\n";
+
+            // 1. Initialize Luau State
+            lua_State* L = luaL_newstate();
+            if (!L) {
+                std::cout << "[-] Failed to create Luau state.\n";
+                return 0;
             }
-        } while (Process32NextW(snap, &pe));
+            
+            // Open standard libraries (math, string, table, etc.)
+            luaL_openlibs(L);
+
+            // 2. Example: Execute a script automatically on inject
+            std::string testScript = 
+                "print('Hello from internal C++ executor!')\n"
+                "local data = HttpGet('https://api.github.com')\n"
+                "print(data)\n"
+                "print('Game Name: ' .. game.Name)\n";
+            
+            ExecuteScript(L, testScript);
+            
+            return 0;
+        }, nullptr, 0, nullptr);
+        break;
     }
-    CloseHandle(snap);
-    return pid;
-}
-
-// ----------------------------------------------------------------
-// enable SeDebugPrivilege — needed to open roblox with full access
-// ----------------------------------------------------------------
-static bool enable_debug_priv() {
-    HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
-        return false;
-
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &tp.Privileges[0].Luid);
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    BOOL ok = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    CloseHandle(tok);
-    return ok && GetLastError() == ERROR_SUCCESS;
-}
-
-// ----------------------------------------------------------------
-// inject DLL into pid via CreateRemoteThread + LoadLibraryW
-// ----------------------------------------------------------------
-static bool inject_dll(DWORD pid, const std::wstring& dll_path) {
-    HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!proc) {
-        printf("[!] OpenProcess failed (err=%lu) — run as admin\n", GetLastError());
-        return false;
-    }
-
-    SIZE_T path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
-    LPVOID remote_mem = VirtualAllocEx(proc, nullptr, path_bytes,
-                                       MEM_COMMIT | MEM_RESERVE,
-                                       PAGE_READWRITE);
-    if (!remote_mem) {
-        printf("[!] VirtualAllocEx failed (err=%lu)\n", GetLastError());
-        CloseHandle(proc);
-        return false;
-    }
-
-    if (!WriteProcessMemory(proc, remote_mem, dll_path.c_str(),
-                            path_bytes, nullptr)) {
-        printf("[!] WriteProcessMemory failed (err=%lu)\n", GetLastError());
-        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-        CloseHandle(proc);
-        return false;
-    }
-
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    if (!k32) {
-        printf("[!] GetModuleHandleW(kernel32) failed\n");
-        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-        CloseHandle(proc);
-        return false;
-    }
-    FARPROC load_lib = GetProcAddress(k32, "LoadLibraryW");
-    if (!load_lib) {
-        printf("[!] GetProcAddress(LoadLibraryW) failed\n");
-        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-        CloseHandle(proc);
-        return false;
-    }
-
-    HANDLE thread = CreateRemoteThread(proc, nullptr, 0,
-                                       (LPTHREAD_START_ROUTINE)load_lib,
-                                       remote_mem, 0, nullptr);
-    if (!thread) {
-        printf("[!] CreateRemoteThread failed (err=%lu)\n", GetLastError());
-        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-        CloseHandle(proc);
-        return false;
-    }
-
-    DWORD wait = WaitForSingleObject(thread, 15000);
-    if (wait == WAIT_TIMEOUT) {
-        printf("[!] injection thread timed out\n");
-        CloseHandle(thread);
-        VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-        CloseHandle(proc);
-        return false;
-    }
-
-    DWORD module_handle = 0;
-    GetExitCodeThread(thread, &module_handle);
-
-    CloseHandle(thread);
-    VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
-    CloseHandle(proc);
-
-    if (module_handle == 0) {
-        printf("[!] LoadLibraryW returned NULL inside roblox\n");
-        printf("    the dll was rejected — wrong architecture, missing deps,\n");
-        printf("    or byfron blocked the load\n");
-        return false;
-    }
-
-    printf("[+] module handle in target: 0x%08lX\n", module_handle);
-    return true;
-}
-
-// ----------------------------------------------------------------
-// main
-// ----------------------------------------------------------------
-int main(int argc, char** argv) {
-    printf("=== dll injector ===\n");
-
-    if (argc < 2) {
-        printf("usage: %s <path-to-dll>\n", argv[0]);
-        printf("press enter to exit.\n");
-        std::cin.get();
-        return 1;
-    }
-
-    char full[MAX_PATH] = {0};
-    if (!GetFullPathNameA(argv[1], MAX_PATH, full, nullptr)) {
-        printf("[!] could not resolve path: %s\n", argv[1]);
-        std::cin.get();
-        return 1;
-    }
-
-    DWORD attrs = GetFileAttributesA(full);
-    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        printf("[!] file not found: %s\n", full);
-        std::cin.get();
-        return 1;
-    }
-
-    wchar_t wide[MAX_PATH] = {0};
-    MultiByteToWideChar(CP_UTF8, 0, full, -1, wide, MAX_PATH);
-    std::wstring dll_path(wide);
-
-    printf("[*] dll: %ls\n", dll_path.c_str());
-
-    if (!enable_debug_priv()) {
-        printf("[!] could not enable SeDebugPrivilege — run as admin\n");
-        std::cin.get();
-        return 1;
-    }
-
-    printf("[*] waiting for RobloxPlayerBeta.exe...\n");
-    DWORD pid = 0;
-    int waited = 0;
-    while (!pid && waited < 60000) {
-        pid = find_pid(L"RobloxPlayerBeta.exe");
-        if (!pid) {
-            Sleep(500);
-            waited += 500;
-        }
-    }
-
-    if (!pid) {
-        printf("[!] roblox not running after 60s — launch the game first\n");
-        std::cin.get();
-        return 1;
-    }
-
-    printf("[+] roblox found (pid %lu)\n", pid);
-    printf("[*] waiting 3s for the client to settle...\n");
-    Sleep(3000);
-
-    printf("[*] injecting...\n");
-    if (inject_dll(pid, dll_path)) {
-        printf("[+] done. check for a console window from the dll.\n");
-    } else {
-        printf("[!] injection failed.\n");
-    }
-
-    printf("press enter to close.\n");
-    std::cin.get();
-    return 0;
+    return TRUE;
 }
